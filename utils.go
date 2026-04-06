@@ -14,21 +14,13 @@ import (
 	"github.com/charmbracelet/log"
 )
 
+// parseDateTime parses an ISO 8601 datetime string (e.g. "2026-04-06T22:30:00").
 func parseDateTime(input string) (time.Time, error) {
-	parts := strings.Split(input, ",")
-	parsed := [5]int{}
-	if len(parts) != 5 {
-		return time.Time{}, fmt.Errorf("invalid input format")
+	t, err := time.Parse("2006-01-02T15:04:05", input)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse datetime %q: %w", input, err)
 	}
-
-	for i, part := range parts {
-		val, err := strconv.Atoi(strings.TrimSpace(part))
-		if err != nil {
-			return time.Time{}, err
-		}
-		parsed[i] = val
-	}
-	return time.Date(parsed[0], time.Month(parsed[1]), parsed[2], parsed[3], parsed[4], 0, 0, time.UTC), nil
+	return t, nil
 }
 
 // TUI styles for formatting EPG display lines.

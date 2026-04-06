@@ -26,7 +26,6 @@ type epgEntry struct {
 	title   string
 	year    int
 	filmID  int
-	sid     int
 	start   string
 	stop    string
 	isMovie bool

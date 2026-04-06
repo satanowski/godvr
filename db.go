@@ -302,7 +302,11 @@ func addEPGEntry(db *sql.DB, title string, year int, fwID int, channelID int, st
 }
 
 func updateChannelEPG(db *sql.DB, ch channel) {
-	epgs := getChannelEPG(ch.key)
+	epgs, err := getChannelEPG(ch.key)
+	if err != nil {
+		log.Error("cannot scrape channel EPG", "channel", ch.name, "err", err)
+		return
+	}
 	ignored, err := getIgnoredFilmwebIDs(db)
 	if err != nil {
 		log.Error("cannot get ignored filmweb IDs", "err", err)
