@@ -2,7 +2,8 @@ clean:
   rm -f dvr
 
 build: clean
-  go build -v -ldflags="-s -w" -o dvr ./ 
+  go vet ./...
+  go build -v -ldflags="-s -w" -o dvr ./
 
 build_linux: clean
   GOOS=linux GOARCH=386 go build -v -ldflags="-s -w" -o dvr_linux ./ && mv dvr_linux /Volumes/apps_storage/dvr/.

@@ -3,91 +3,111 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"syscall"
+
+	"github.com/charmbracelet/log"
 )
 
-var dvb_front = atoi(os.ExpandEnv("$DVR_DVB_FRONT"), 1)
-var dvb_lna = atoi(os.ExpandEnv("$DVR_DVB_LNA"), 1)
-var dvb_dongles_count = atoi(os.ExpandEnv("$DVR_DVB_DONGLES_COUNT"), 1)
-var dvb_channels_file = os.ExpandEnv("$DVR_CHANNELS_FILE")
-var dvb_rec_dir = os.ExpandEnv("$DVR_REC_DIR")
+var dvbFront = atoi(os.ExpandEnv("$DVR_DVB_FRONT"), 1)
+var dvbLNA = atoi(os.ExpandEnv("$DVR_DVB_LNA"), 1)
+var dvbDonglesCount = atoi(os.ExpandEnv("$DVR_DVB_DONGLES_COUNT"), 1)
+var dvbChannelsFile = os.ExpandEnv("$DVR_CHANNELS_FILE")
+var dvbRecDir = os.ExpandEnv("$DVR_REC_DIR")
 
-const dvb_zap string = "/usr/bin/dvbv5-zap"
+const dvbZap string = "/usr/bin/dvbv5-zap"
 
-func dvb_adapters_present() bool {
-	matches, _ := filepath.Glob(fmt.Sprintf("/dev/dvb/*/frontend%d", dvb_front))
+// validChannelName matches only safe channel identifiers (alphanumeric, dashes, underscores, dots, spaces)
+var validChannelName = regexp.MustCompile(`^[a-zA-Z0-9 _.\-]+$`)
+
+func dvbAdaptersPresent() bool {
+	matches, _ := filepath.Glob(fmt.Sprintf("/dev/dvb/*/frontend%d", dvbFront))
 	return len(matches) > 0
 }
 
-func get_free_recorder(db *sql.DB) int {
-	occupied_recorders := get_occupied_recorders(db)
-	for i := range dvb_dongles_count {
-		_, ok := occupied_recorders[i]
+func getFreeRecorder(db *sql.DB) int {
+	occupiedRecorders, err := getOccupiedRecorders(db)
+	if err != nil {
+		log.Error("Cannot get occupied recorders", "err", err)
+		return noRecorder
+	}
+	for i := range dvbDonglesCount {
+		_, ok := occupiedRecorders[i]
 		if !ok { // i-th recorder not occupied
 			return i
 		}
 	}
-	return -1
+	return noRecorder
 }
 
-type ZapCmd struct {
+type zapCmd struct {
 	cmd     string
 	args    []string
 	adapter int
+	pgid    bool // whether process group was set
 }
 
-func PrepareZapCMD(db *sql.DB, epg SchedulableEPG, time_shift_min int) ZapCmd {
-	adapter := get_free_recorder(db)
-	if adapter < 0 {
-		return ZapCmd{adapter: -1}
+func prepareZapCmd(db *sql.DB, epg schedulableEPG, timeShiftMin int) (zapCmd, error) {
+	// Validate channel name to prevent command argument injection
+	if !validChannelName.MatchString(epg.channel) {
+		return zapCmd{adapter: noRecorder}, fmt.Errorf("invalid channel name: %q", epg.channel)
 	}
 
-	return ZapCmd{
+	adapter := getFreeRecorder(db)
+	if adapter < 0 {
+		return zapCmd{adapter: noRecorder}, nil
+	}
+
+	return zapCmd{
 		cmd: "/usr/bin/timeout",
 		args: []string{
-			"-s", "9",
-			strconv.Itoa((epg.duration() * 60) + time_shift_min),
-			dvb_zap,
+			"-s", killSignal,
+			strconv.Itoa((epg.duration() * 60) + timeShiftMin),
+			dvbZap,
 			"-a", strconv.Itoa(adapter),
-			"-f", strconv.Itoa(dvb_front),
-			fmt.Sprintf("--lna=%d", dvb_lna),
-			"-c", dvb_channels_file,
+			"-f", strconv.Itoa(dvbFront),
+			fmt.Sprintf("--lna=%d", dvbLNA),
+			"-c", dvbChannelsFile,
 			epg.channel,
-			"-r", "-o", get_save_movie_file_name(epg),
+			"-r", "-o", getSafeMovieFileName(epg),
 		},
 		adapter: adapter,
-	}
+		pgid:    true,
+	}, nil
 }
 
-func RunAndForget(zap_cmd ZapCmd) int {
-	cmd := exec.Command(zap_cmd.cmd, zap_cmd.args...)
+func runAndForget(zc zapCmd) (int, error) {
+	cmd := exec.Command(zc.cmd, zc.args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Create a new process group so we can kill the entire tree later
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	err := cmd.Start()
 	if err != nil {
-		log.Fatalf("Failed to start command: %v", err)
-		return 0
+		return 0, fmt.Errorf("failed to start recording command: %w", err)
 	}
-	return cmd.Process.Pid
+	return cmd.Process.Pid, nil
 }
 
-func RecorderProcessExists(pid int) bool {
-	_, err := os.FindProcess(pid)
+func recorderProcessExists(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// On Unix, FindProcess always succeeds. Send signal 0 to check if process is alive.
+	err = process.Signal(syscall.Signal(0))
 	return err == nil
 }
 
-func KillRecorderProcess(pid int) error {
-	process, err := os.FindProcess(pid)
+func killRecorderProcess(pid int) error {
+	// Kill the entire process group (negative PID) to ensure child processes are also terminated
+	err := syscall.Kill(-pid, syscall.SIGKILL)
 	if err != nil {
-		return err
-	}
-	err = process.Kill()
-	if err != nil {
-		return err
+		return fmt.Errorf("failed to kill process group for PID %d: %w", pid, err)
 	}
 	return nil
 }

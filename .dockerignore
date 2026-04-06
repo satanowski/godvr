@@ -1,0 +1,9 @@
+.git
+.gitignore
+.golangci.yml
+*.md
+justfile
+dvr
+dvr_linux
+Dockerfile
+.dockerignore

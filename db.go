@@ -2,41 +2,67 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
-
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
-var db_style = lipgloss.NewStyle().Foreground(lipgloss.Color("#E7821D"))
+var dbStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#E7821D"))
 
-func get_chanels(db *sql.DB) []Channel {
-	channel_keys := []Channel{}
-	rows, err := db.Query(`SELECT "id","key","name" FROM "channel"`)
-	if err != nil {
-		panic(err)
-	}
+// PostgreSQL error codes.
+const (
+	pqUniqueViolation     = "23505"
+	pqForeignKeyViolation = "23503"
+)
 
-	defer rows.Close()
-	for rows.Next() {
-		var channel Channel
-		err = rows.Scan(&channel.id, &channel.key, &channel.name)
-		if err != nil {
-			continue
-		}
-		channel_keys = append(channel_keys, channel)
+func isPQError(err error, code string) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code) == code
 	}
-	return channel_keys
+	return false
 }
 
-func get_schedulable_epgs(db *sql.DB, channel_key string) []SchedulableEPG {
-	epgs := []SchedulableEPG{}
-	qselect := `
+// scanRows iterates over sql.Rows and scans each row using the provided function.
+// It handles row closing and iteration errors uniformly.
+func scanRows[T any](rows *sql.Rows, scanFn func(*sql.Rows) (T, error)) ([]T, error) {
+	defer rows.Close()
+	var result []T
+	for rows.Next() {
+		item, err := scanFn(rows)
+		if err != nil {
+			log.Warn("failed to scan row", "err", err)
+			continue
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return result, fmt.Errorf("row iteration: %w", err)
+	}
+	return result, nil
+}
+
+func getChannels(db *sql.DB) ([]channel, error) {
+	rows, err := db.Query(`SELECT "id","key","name" FROM "channel"`)
+	if err != nil {
+		return nil, fmt.Errorf("get channels: %w", err)
+	}
+	return scanRows(rows, func(r *sql.Rows) (channel, error) {
+		var ch channel
+		err := r.Scan(&ch.id, &ch.key, &ch.name)
+		return ch, err
+	})
+}
+
+// getSchedulableEPGs returns future EPG entries that can be scheduled.
+// Pass channelKey="all" to get entries for all channels.
+func getSchedulableEPGs(db *sql.DB, channelKey string) ([]schedulableEPG, error) {
+	baseQuery := `
 SELECT
 	epg.id,
 	filmweb.title,
@@ -47,39 +73,36 @@ SELECT
 FROM
 	public.epg
 	INNER JOIN filmweb ON epg.fw_id = filmweb.id
-	INNER JOIN channel ON epg.channel_id = channel.id`
+	INNER JOIN channel ON epg.channel_id = channel.id
+WHERE
+	filmweb.ignored = false
+	AND epg.scheduled = false
+	AND epg.start_time >= now()
+	AND filmweb.recorded = false`
 
-	qwhere := "filmweb.ignored = false and epg.scheduled = false and epg.start_time >= now() and filmweb.recorded = false"
-	if channel_key != "all" {
-		qwhere = fmt.Sprintf("%s and channel.key = '%s'", qwhere, channel_key)
+	var rows *sql.Rows
+	var err error
+	if channelKey != "all" {
+		rows, err = db.Query(baseQuery+`
+	AND channel.key = $1
+ORDER BY filmweb.title ASC, channel.name ASC`, channelKey)
+	} else {
+		rows, err = db.Query(baseQuery + `
+ORDER BY filmweb.title ASC, channel.name ASC`)
 	}
-	query := fmt.Sprintf("%s WHERE %s ORDER BY filmweb.title ASC, channel.name ASC", qselect, qwhere)
-
-	rows, err := db.Query(query)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get schedulable EPGs: %w", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var epg SchedulableEPG
-		err = rows.Scan(&epg.id, &epg.title, &epg.year, &epg.channel, &epg.start, &epg.stop)
-		if err != nil {
-			continue
-		}
-		epgs = append(epgs, epg)
-	}
-	return epgs
+	return scanRows(rows, scanSchedulableEPG)
 }
 
-func get_scheduled_epgs(db *sql.DB, only_today bool) []SchedulableEPG {
-	epgs := []SchedulableEPG{}
-	qwhere := `epg.scheduled = true and epg.start_time >= now()`
-	if only_today {
-		qwhere = qwhere + `AND epg.start_time <= current_date+1`
+func getScheduledEPGs(db *sql.DB, onlyToday bool) ([]schedulableEPG, error) {
+	where := `epg.scheduled = true AND epg.start_time >= now()`
+	if onlyToday {
+		where += ` AND epg.start_time <= current_date+1`
 	}
 
-	qselect := `
+	query := fmt.Sprintf(`
 SELECT
 	epg.id,
 	filmweb.title,
@@ -96,91 +119,77 @@ WHERE
 ORDER BY
 	filmweb.title ASC,
 	epg.start_time,
-	channel.name ASC`
+	channel.name ASC`, where)
 
-	rows, err := db.Query(fmt.Sprintf(qselect, qwhere))
+	rows, err := db.Query(query)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get scheduled EPGs: %w", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var epg SchedulableEPG
-		err = rows.Scan(&epg.id, &epg.title, &epg.year, &epg.channel, &epg.start, &epg.stop)
-		if err != nil {
-			continue
-		}
-		epgs = append(epgs, epg)
-	}
-	return epgs
+	return scanRows(rows, scanSchedulableEPG)
 }
 
-func get_channel_by_key(db *sql.DB, channel_key string) Channel {
-	var channel Channel
-	row := db.QueryRow(`SELECT * FROM channel WHERE key=$1`, channel_key)
-	err := row.Scan(&channel.id, &channel.key, &channel.name)
-	switch err {
-	case sql.ErrNoRows:
-		log.Error("No channel named: ", channel_key)
-		return channel
-	case nil:
-		return channel
-	default:
-		panic(err)
-	}
+// scanSchedulableEPG scans a basic schedulableEPG (id, title, year, channel, start, stop).
+func scanSchedulableEPG(r *sql.Rows) (schedulableEPG, error) {
+	var epg schedulableEPG
+	err := r.Scan(&epg.id, &epg.title, &epg.year, &epg.channel, &epg.start, &epg.stop)
+	return epg, err
 }
 
-func fw_entry_exists(db *sql.DB, id int) bool {
-	var fwId int
-	row := db.QueryRow("SELECT id FROM filmweb WHERE id = ?", id)
-	if err := row.Scan(&fwId); err != nil {
-		if err == sql.ErrNoRows {
-			return false
-		}
+func getChannelByKey(db *sql.DB, channelKey string) (channel, error) {
+	var ch channel
+	row := db.QueryRow(`SELECT * FROM channel WHERE key=$1`, channelKey)
+	err := row.Scan(&ch.id, &ch.key, &ch.name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ch, fmt.Errorf("get channel by key: no channel with key %q", channelKey)
 	}
-	return fwId > 0
+	if err != nil {
+		return ch, fmt.Errorf("get channel by key: %w", err)
+	}
+	return ch, nil
 }
 
-func get_ignored_fwilmweb_ids(db *sql.DB) map[int]bool {
-	ignored := map[int]bool{}
+func fwEntryExists(db *sql.DB, id int) bool {
+	var fwID int
+	row := db.QueryRow("SELECT id FROM filmweb WHERE id = $1", id)
+	if err := row.Scan(&fwID); err != nil {
+		return false
+	}
+	return fwID > 0
+}
 
+func getIgnoredFilmwebIDs(db *sql.DB) (map[int]bool, error) {
 	rows, err := db.Query(`SELECT id FROM filmweb WHERE ignored=true`)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get ignored filmweb IDs: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var fw_id int
-		err := rows.Scan(&fw_id)
-		if err != nil {
-			continue
-		}
-		ignored[fw_id] = true
+	items, err := scanRows(rows, func(r *sql.Rows) (int, error) {
+		var id int
+		return id, r.Scan(&id)
+	})
+	if err != nil {
+		return nil, err
 	}
-	return ignored
+	result := make(map[int]bool, len(items))
+	for _, id := range items {
+		result[id] = true
+	}
+	return result, nil
 }
 
-func get_ignorable_movies(db *sql.DB) []Movie {
-	ignorable := []Movie{}
+func getIgnorableMovies(db *sql.DB) ([]movie, error) {
 	rows, err := db.Query(`SELECT id, title, year FROM filmweb WHERE ignored=false ORDER BY title ASC, year ASC`)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get ignorable movies: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var movie Movie
-		err := rows.Scan(&movie.id, &movie.title, &movie.year)
-		if err != nil {
-			continue
-		}
-		ignorable = append(ignorable, movie)
-	}
-	return ignorable
+	return scanRows(rows, func(r *sql.Rows) (movie, error) {
+		var m movie
+		err := r.Scan(&m.id, &m.title, &m.year)
+		return m, err
+	})
 }
 
-func recordings_to_start(db *sql.DB, time_shift_min int) []SchedulableEPG {
-	to_start := []SchedulableEPG{}
-	sql := `
+func recordingsToStart(db *sql.DB, timeShiftMin int) ([]schedulableEPG, error) {
+	q := `
 SELECT
 	epg.id,
 	filmweb.title,
@@ -195,30 +204,24 @@ FROM
 	INNER JOIN channel ON epg.channel_id = channel.id
 WHERE
 	epg.scheduled = true
-	AND epg.recorder = -1
-	AND epg.start_time - interval '%d minutes' <= now() 
+	AND epg.recorder = $1
+	AND epg.start_time - make_interval(mins => $2) <= now()
 	AND epg.start_time + interval '10 second' >= now()
 ORDER BY
 	epg.start_time ASC`
-	rows, err := db.Query(fmt.Sprintf(sql, time_shift_min))
+	rows, err := db.Query(q, noRecorder, timeShiftMin)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("recordings to start: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var epg SchedulableEPG
-		err := rows.Scan(&epg.id, &epg.title, &epg.year, &epg.channel, &epg.start, &epg.stop, &epg.fwid)
-		if err != nil {
-			continue
-		}
-		to_start = append(to_start, epg)
-	}
-	return to_start
+	return scanRows(rows, func(r *sql.Rows) (schedulableEPG, error) {
+		var epg schedulableEPG
+		err := r.Scan(&epg.id, &epg.title, &epg.year, &epg.channel, &epg.start, &epg.stop, &epg.fwID)
+		return epg, err
+	})
 }
 
-func recordings_to_stop(db *sql.DB, time_shift_min int) []SchedulableEPG {
-	to_stop := []SchedulableEPG{}
-	sql := `
+func recordingsToStop(db *sql.DB, timeShiftMin int) ([]schedulableEPG, error) {
+	q := `
 SELECT
 	epg.id,
 	filmweb.title,
@@ -235,222 +238,219 @@ FROM
 	INNER JOIN channel ON epg.channel_id = channel.id
 WHERE
 	epg.scheduled = true
-	AND epg.recorder > -1
-	AND epg.stop_time + interval '%d minutes' <= now()
-	AND epg.stop_time + interval '%d minutes 10second' > now()
+	AND epg.recorder > $1
+	AND epg.stop_time + make_interval(mins => $2) <= now()
+	AND epg.stop_time + make_interval(mins => $2) + interval '10 second' > now()
 ORDER BY
 	epg.start_time ASC`
-	rows, err := db.Query(fmt.Sprintf(sql, time_shift_min, time_shift_min))
+	rows, err := db.Query(q, noRecorder, timeShiftMin)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("recordings to stop: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var epg SchedulableEPG
-		err := rows.Scan(
-			&epg.id,
-			&epg.title,
-			&epg.year,
-			&epg.fwid,
-			&epg.channel,
-			&epg.start,
-			&epg.stop,
-			&epg.recorder,
-			&epg.pid,
-		)
-		if err != nil {
-			continue
-		}
-		to_stop = append(to_stop, epg)
-	}
-	return to_stop
+	return scanRows(rows, func(r *sql.Rows) (schedulableEPG, error) {
+		var epg schedulableEPG
+		err := r.Scan(&epg.id, &epg.title, &epg.year, &epg.fwID, &epg.channel, &epg.start, &epg.stop, &epg.recorder, &epg.pid)
+		return epg, err
+	})
 }
 
-func get_occupied_recorders(db *sql.DB) map[int]bool {
-	results := map[int]bool{}
-	rows, err := db.Query(`SELECT distinct(recorder) FROM epg WHERE recorder > -1`)
+func getOccupiedRecorders(db *sql.DB) (map[int]bool, error) {
+	rows, err := db.Query(`SELECT distinct(recorder) FROM epg WHERE recorder > $1`, noRecorder)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get occupied recorders: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
+	items, err := scanRows(rows, func(r *sql.Rows) (int, error) {
 		var rec int
-		if rows.Scan(&rec) != nil {
-			continue
-		}
-		results[rec] = true
-	}
-	return results
-}
-
-func add_filmweb_entry(db *sql.DB, fw_id int, fw_title string, fw_year int) {
-	insert_stm := `insert into "filmweb" ("id", "title", "year", "ignored", "recorded") values($1, $2, $3, $4, $5)`
-	_, err := db.Exec(
-		insert_stm,
-		fw_id,
-		fw_title,
-		fw_year,
-		false,
-		false,
-	)
+		return rec, r.Scan(&rec)
+	})
 	if err != nil {
-		if strings.Contains(err.Error(), "epg_fw_id_start_time_idx") || strings.Contains(err.Error(), "filmweb_pkey") {
-			// duplicated field, ignore
-		} else {
-			log.Warn(fmt.Sprintf("Cannot add Filmweb entry: %s (%d):\t %v", fw_title, fw_year, err))
-		}
+		return nil, err
 	}
+	result := make(map[int]bool, len(items))
+	for _, rec := range items {
+		result[rec] = true
+	}
+	return result, nil
 }
 
-func add_epg_entry(db *sql.DB, title string, year int, fw_id int, channel_id int, start_time time.Time, stop_time time.Time) {
-	insert_stm := `insert into "epg" ("fw_id", "channel_id", "start_time", "stop_time", "scheduled", "recorder") values($1, $2, $3, $4, $5, $6)`
-	_, err := db.Exec(
-		insert_stm,
-		fw_id,
-		channel_id,
-		start_time,
-		stop_time,
-		false,
-		-1,
-	)
+func addFilmwebEntry(db *sql.DB, fwID int, fwTitle string, fwYear int) {
+	insertStm := `INSERT INTO "filmweb" ("id", "title", "year", "ignored", "recorded") VALUES($1, $2, $3, $4, $5)`
+	_, err := db.Exec(insertStm, fwID, fwTitle, fwYear, false, false)
 	if err != nil {
-		if strings.Contains(err.Error(), "epg_fw_id_fkey") || strings.Contains(err.Error(), "epg_fw_id_start_time_idx") {
-		} else {
-			log.Warn(fmt.Sprintf("Cannot add EPG entry: %s (%d):\t %v", title, fw_id, err))
+		if isPQError(err, pqUniqueViolation) {
+			return
 		}
+		log.Warn("cannot add filmweb entry", "title", fwTitle, "year", fwYear, "err", err)
 	}
-	if !fw_entry_exists(db, fw_id) {
-		log.Debug(fmt.Sprintf("Adding new FilmwebEntry: '%s' (%d)", title, year))
-		add_filmweb_entry(db, fw_id, title, year)
-	}
-
 }
 
-func update_channel_epg(db *sql.DB, channel Channel) {
-	epgs := get_channel_epg(channel.key)
-	ignored := get_ignored_fwilmweb_ids(db)
+func addEPGEntry(db *sql.DB, title string, year int, fwID int, channelID int, startTime time.Time, stopTime time.Time) {
+	// Ensure the filmweb entry exists before inserting the EPG entry (FK constraint).
+	if !fwEntryExists(db, fwID) {
+		log.Debug("adding new filmweb entry", "title", title, "year", year)
+		addFilmwebEntry(db, fwID, title, year)
+	}
+
+	insertStm := `INSERT INTO "epg" ("fw_id", "channel_id", "start_time", "stop_time", "scheduled", "recorder") VALUES($1, $2, $3, $4, $5, $6)`
+	_, err := db.Exec(insertStm, fwID, channelID, startTime, stopTime, false, noRecorder)
+	if err != nil {
+		if isPQError(err, pqUniqueViolation) || isPQError(err, pqForeignKeyViolation) {
+			return
+		}
+		log.Warn("cannot add EPG entry", "title", title, "fw_id", fwID, "err", err)
+	}
+}
+
+func updateChannelEPG(db *sql.DB, ch channel) {
+	epgs := getChannelEPG(ch.key)
+	ignored, err := getIgnoredFilmwebIDs(db)
+	if err != nil {
+		log.Error("cannot get ignored filmweb IDs", "err", err)
+		return
+	}
 	for _, epg := range epgs {
-
-		_, ok := ignored[epg.filmId]
-		if ok {
-			//log.Debug(fmt.Sprintf("Movie '%s' is ignored", epg.title))
+		if ignored[epg.filmID] {
 			continue
 		}
-		start_datetime, err := parseDateTime(epg.start)
+		startDatetime, err := parseDateTime(epg.start)
 		if err != nil {
-			log.Warn(fmt.Sprintf("Cannot parse start time: '%s' ", epg.start))
+			log.Warn("cannot parse start time", "start", epg.start, "err", err)
 			continue
 		}
-		stop_datetime, err := parseDateTime(epg.stop)
+		stopDatetime, err := parseDateTime(epg.stop)
 		if err != nil {
-			log.Warn(fmt.Sprintf("Cannot parse stop time: '%s' ", epg.stop))
+			log.Warn("cannot parse stop time", "stop", epg.stop, "err", err)
 			continue
 		}
-		if start_datetime.After(time.Now()) {
-			add_epg_entry(db, epg.title, epg.year, epg.filmId, channel.id, start_datetime, stop_datetime)
+		if startDatetime.After(time.Now()) {
+			addEPGEntry(db, epg.title, epg.year, epg.filmID, ch.id, startDatetime, stopDatetime)
 		}
 	}
 }
 
-func update_epgs(db *sql.DB, channel_key string) {
-	var channels []Channel
-
-	if channel_key == "all" {
-		channels = get_chanels(db)
-	} else {
-		channels = []Channel{get_channel_by_key(db, channel_key)}
-	}
-
-	for _, channel := range channels {
-		log.Info(fmt.Sprintf("Checking %s...", channel.name))
-		update_channel_epg(db, channel)
-	}
-
-}
-
-func schedule_recording(db *sql.DB, epg_id string) {
-	_, err := db.Exec(`UPDATE epg SET scheduled = true WHERE id = $1;`, epg_id)
+func updateEPGs(db *sql.DB, channelKey string) {
+	channels, err := resolveChannels(db, channelKey)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot schedule EPG.ID = %s", epg_id))
+		log.Error("cannot resolve channels", "key", channelKey, "err", err)
+		return
+	}
+	for _, ch := range channels {
+		log.Info("checking channel...", "name", ch.name)
+		updateChannelEPG(db, ch)
 	}
 }
 
-func unschedule_recording(db *sql.DB, epg_id string) {
-	_, err := db.Exec(`UPDATE epg SET scheduled = false WHERE id = $1;`, epg_id)
+// resolveChannels returns a list of channels for the given key.
+// If key is "all", all channels are returned; otherwise a single matching channel.
+func resolveChannels(db *sql.DB, channelKey string) ([]channel, error) {
+	if channelKey == "all" {
+		return getChannels(db)
+	}
+	ch, err := getChannelByKey(db, channelKey)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot schedule EPG.ID = %s", epg_id))
+		return nil, err
 	}
+	return []channel{ch}, nil
 }
 
-func ignore_movie(db *sql.DB, fw_id string) {
-	_, err := db.Exec(`UPDATE filmweb SET ignored = true WHERE id = $1;`, fw_id)
+// setEPGScheduled sets the scheduled flag for an EPG entry.
+func setEPGScheduled(db *sql.DB, epgID string, scheduled bool) error {
+	_, err := db.Exec(`UPDATE epg SET scheduled = $1 WHERE id = $2`, scheduled, epgID)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot ignore movie with ID = %s", fw_id))
+		return fmt.Errorf("set EPG scheduled=%v id=%s: %w", scheduled, epgID, err)
 	}
+	return nil
 }
 
-func mark_epg_being_recorded(db *sql.DB, epg_id int, recorder int, pid int) {
-	_, err := db.Exec(`UPDATE epg SET recorder = $1, pid = $2 WHERE id = $3;`, recorder, pid, epg_id)
+func ignoreMovie(db *sql.DB, fwID string) error {
+	_, err := db.Exec(`UPDATE filmweb SET ignored = true WHERE id = $1`, fwID)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot mark EPG %d as being recorded (adapter: %d, pid: %d)!", epg_id, recorder, pid))
+		return fmt.Errorf("ignore movie id=%s: %w", fwID, err)
 	}
+	return nil
 }
 
-func mark_fw_as_recorded(db *sql.DB, fw_id int) {
-	_, err := db.Exec(`UPDATE filmweb SET recorded = true WHERE id = $1;`, fw_id)
+func markEPGBeingRecorded(db *sql.DB, epgID int, recorder int, pid int) error {
+	_, err := db.Exec(`UPDATE epg SET recorder = $1, pid = $2 WHERE id = $3`, recorder, pid, epgID)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot mark FW movie with ID = %d as recorded", fw_id))
+		return fmt.Errorf("mark EPG being recorded epg_id=%d: %w", epgID, err)
 	}
+	return nil
 }
 
-func mark_epg_being_not_recorded(db *sql.DB, epg_id int) {
-	_, err := db.Exec(`UPDATE epg SET recorder = -1, pid =0, scheduled = false WHERE id = $1;`, epg_id)
+func markFWAsRecorded(db *sql.DB, fwID int) error {
+	_, err := db.Exec(`UPDATE filmweb SET recorded = true WHERE id = $1`, fwID)
 	if err != nil {
-		log.Warn(fmt.Sprintf("Cannot mark EPG %d as being not recorded!", epg_id))
+		return fmt.Errorf("mark filmweb recorded fw_id=%d: %w", fwID, err)
 	}
+	return nil
 }
 
-func get_fw_by_title_year(db *sql.DB, title string, year string) (FwEntry, error) {
-	var fwrec FwEntry
-	query := `SELECT id,title,year,ignored, recorded FROM filmweb WHERE SIMILARITY(title, $1) > 0.6 and year = $2;`
+func markEPGNotRecorded(db *sql.DB, epgID int) error {
+	_, err := db.Exec(`UPDATE epg SET recorder = $1, pid = 0, scheduled = false WHERE id = $2`, noRecorder, epgID)
+	if err != nil {
+		return fmt.Errorf("mark EPG not recorded epg_id=%d: %w", epgID, err)
+	}
+	return nil
+}
+
+func getFWByTitleYear(db *sql.DB, title string, year string) (fwEntry, error) {
+	var fwrec fwEntry
+	query := fmt.Sprintf(
+		`SELECT id,title,year,ignored,recorded FROM filmweb WHERE SIMILARITY(title, $1) > %g AND year = $2`,
+		similarityThreshold,
+	)
 	row := db.QueryRow(query, title, year)
 	err := row.Scan(&fwrec.id, &fwrec.title, &fwrec.year, &fwrec.ignored, &fwrec.recorded)
-	return fwrec, err
+	if err != nil {
+		return fwrec, fmt.Errorf("get filmweb by title/year: %w", err)
+	}
+	return fwrec, nil
 }
 
-func vacuming(db *sql.DB) {
-	// remove EPGs related to ignored movies
-	_, err := db.Exec(`DELETE FROM epg USING filmweb WHERE epg.fw_id = filmweb.id AND filmweb.ignored = true;`)
-	if err != nil {
-		log.Warn("Cannot remove ignored EPGs")
-	} else {
-		fmt.Println(db_style.Render(" - ignored movies removed from EPG"))
-	}
-
-	// remove EPGs of movies that are allready recorded
-	_, err = db.Exec(`DELETE FROM epg USING filmweb WHERE epg.fw_id = filmweb.id AND filmweb.recorded = true;`)
-	if err != nil {
-		log.Warn("Cannot remove ignored EPGs")
-	} else {
-		fmt.Println(db_style.Render(" - already recorded movies removed from EPG"))
-	}
-
-	// remove old EPGs
-	_, err = db.Exec(`DELETE FROM epg WHERE EPG.START_TIME < NOW() - INTERVAL '10 minutes'`)
-	if err != nil {
-		log.Warn("Cannot remove old epgs EPGs")
-	} else {
-		fmt.Println(db_style.Render(" - passed movies removed from EPG"))
-	}
-
+// vacuumStep defines a single vacuum operation.
+type vacuumStep struct {
+	query   string
+	message string
 }
 
-func db_init_conn() *sql.DB {
+var vacuumSteps = []vacuumStep{
+	{
+		query:   `DELETE FROM epg USING filmweb WHERE epg.fw_id = filmweb.id AND filmweb.ignored = true`,
+		message: " - ignored movies removed from EPG",
+	},
+	{
+		query:   `DELETE FROM epg USING filmweb WHERE epg.fw_id = filmweb.id AND filmweb.recorded = true`,
+		message: " - already recorded movies removed from EPG",
+	},
+	{
+		query:   `DELETE FROM epg WHERE epg.start_time < NOW() - INTERVAL '10 minutes'`,
+		message: " - passed movies removed from EPG",
+	},
+}
+
+func vacuum(db *sql.DB) {
+	for _, step := range vacuumSteps {
+		if _, err := db.Exec(step.query); err != nil {
+			log.Warn("vacuum step failed", "msg", step.message, "err", err)
+			continue
+		}
+		fmt.Println(dbStyle.Render(step.message))
+	}
+}
+
+func dbInitConn() *sql.DB {
 	psqlconn := os.ExpandEnv("$DVR_PG_CONN")
+	if psqlconn == "" || psqlconn == "$DVR_PG_CONN" {
+		log.Fatal("$DVR_PG_CONN environment variable is not set")
+	}
 	db, err := sql.Open("postgres", psqlconn)
 	if err != nil {
-		log.Error(fmt.Sprintf("Cannot connect to database: %s !\n", psqlconn))
-		panic(err)
+		log.Fatal("cannot connect to database, check $DVR_PG_CONN", "err", err)
 	}
+	// Configure connection pool for long-running watch mode.
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
 	return db
 }

@@ -1,4 +1,4 @@
-module main
+module github.com/satanowski/godvr
 
 go 1.23.4
 
