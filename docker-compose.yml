@@ -1,0 +1,27 @@
+services:
+  dvr:
+    build: .
+    image: dvr
+    command: ["w"]
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DVR_PG_CONN: "host=psql.local.net port=5432 user=daras password=zaq12wsx dbname=dvr sslmode=disable"
+      DVR_DVB_FRONT: "1"
+      DVR_DVB_LNA: "1"
+      DVR_DVB_DONGLES_COUNT: "1"
+      DVR_CHANNELS_FILE: "/config/channels.conf"
+      DVR_REC_DIR: "/rec"
+      DVR_REC_DONE_DIR: "/rec/done"
+      DVR_TIME_SHIFT_BEFORE: "10"
+      DVR_TIME_SHIFT_AFTER: "15"
+      DVR_INTERVAL_SEC: "10"
+      TZ: "Europe/Warsaw"
+    volumes:
+      - ./channels.conf:/config/channels.conf:ro
+      - recordings:/rec
+    devices:
+      - /dev/dvb:/dev/dvb

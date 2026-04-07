@@ -12,5 +12,8 @@ dbuild:
   docker build -t dvr . && \
   docker save dvr | pv | ssh nas docker load
 
+test:
+  go test -v ./...
+
 run:
   go run *.go
